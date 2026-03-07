@@ -2,6 +2,10 @@
 
 自托管的 [Forward App](https://apps.apple.com/app/id6503940939) 模块托管平台。上传 `.js` 小组件或 `.fwd` 订阅文件，自动生成可在 Forward App 中导入的订阅链接。
 
+**在线示例：** https://forward-widget-hub.danmu.workers.dev
+
+> **注意：** 示例站仅供体验和测试，请勿将其作为正式使用。站内内容随时可能被清空或删除，请自行部署后使用。
+
 ## 功能特性
 
 - **拖拽上传** — 支持 `.js` 和 `.fwd` 文件的拖拽或点击上传
