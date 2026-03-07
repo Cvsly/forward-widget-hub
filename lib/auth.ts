@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { getDb } from "./db";
+import { getBackendDb } from "./backend";
 
 const TOKEN_PREFIX = "fwt_";
 
@@ -30,10 +30,10 @@ export function extractToken(request: Request): string | null {
   return null;
 }
 
-export function authenticateToken(token: string): { userId: string } | null {
-  const db = getDb();
+export async function authenticateToken(token: string): Promise<{ userId: string } | null> {
+  const db = await getBackendDb();
   const hash = hashToken(token);
-  const row = db
+  const row = await db
     .prepare("SELECT id FROM users WHERE token_hash = ?")
     .get(hash) as { id: string } | undefined;
   if (!row) return null;

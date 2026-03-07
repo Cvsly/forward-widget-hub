@@ -1,41 +1,165 @@
 import { NextRequest, NextResponse } from "next/server";
 import { nanoid } from "nanoid";
-import { getDb } from "@/lib/db";
+import { getBackendDb, getBackendStore } from "@/lib/backend";
 import { generateToken, hashToken, getTokenPrefix } from "@/lib/auth";
 import { parseWidgetMetadata, isEncrypted } from "@/lib/parser";
-import { saveModule } from "@/lib/storage";
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+const DOWNLOAD_TIMEOUT = 30_000; // 30s per remote file
+
+interface FwdWidget {
+  id?: string;
+  title?: string;
+  description?: string;
+  version?: string;
+  author?: string;
+  requiredVersion?: string;
+  url: string;
+}
+
+interface FwdIndex {
+  title?: string;
+  description?: string;
+  icon?: string;
+  widgets: FwdWidget[];
+}
+
+type ModuleInfo = { id: string; filename: string; title: string; version?: string; encrypted: boolean };
+
+async function downloadRemoteJs(url: string): Promise<{ buffer: Buffer; filename: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT);
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "Forward" } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_FILE_SIZE) throw new Error("Remote file exceeds 5MB limit");
+    const urlPath = new URL(url).pathname;
+    const filename = urlPath.split("/").pop() || "widget.js";
+    return { buffer: buf, filename };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseFwdFile(content: string): FwdIndex {
+  const parsed = JSON.parse(content);
+  if (!parsed.widgets || !Array.isArray(parsed.widgets)) {
+    throw new Error("Invalid .fwd format: missing widgets array");
+  }
+  for (const w of parsed.widgets) {
+    if (!w.url || typeof w.url !== "string") {
+      throw new Error("Invalid .fwd format: widget missing url");
+    }
+  }
+  return parsed as FwdIndex;
+}
+
+async function downloadRemoteFile(url: string): Promise<{ buffer: Buffer; filename: string; isFwd: boolean }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT);
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "Forward" } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_FILE_SIZE) throw new Error("Remote file exceeds 5MB limit");
+    const urlPath = new URL(url).pathname;
+    const filename = urlPath.split("/").pop() || "widget.js";
+    const isFwd = filename.endsWith(".fwd") || (() => {
+      try { const j = JSON.parse(buf.toString("utf8")); return Array.isArray(j.widgets); } catch { return false; }
+    })();
+    return { buffer: buf, filename, isFwd };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function createProgressStream(
+  fn: (send: (event: Record<string, unknown>) => void) => Promise<void>,
+): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: Record<string, unknown>) => {
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+      };
+      try {
+        await fn(send);
+      } catch (e) {
+        send({ type: "error", error: (e as Error).message });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: { "Content-Type": "text/x-ndjson", "Cache-Control": "no-cache" },
+  });
+}
+
+async function downloadAndStoreWidget(
+  widget: FwdWidget,
+  collectionId: string,
+  db: Awaited<ReturnType<typeof getBackendDb>>,
+  store: Awaited<ReturnType<typeof getBackendStore>>,
+): Promise<ModuleInfo> {
+  const dl = await downloadRemoteJs(widget.url);
+  const encrypted = isEncrypted(dl.buffer);
+  const meta = encrypted ? null : parseWidgetMetadata(dl.buffer.toString("utf8"));
+  const moduleId = nanoid();
+  await db.prepare(
+    `INSERT INTO modules (id, collection_id, filename, widget_id, title, description, version, author, file_size, is_encrypted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    moduleId, collectionId, dl.filename,
+    widget.id || meta?.id || null,
+    widget.title || meta?.title || dl.filename.replace(".js", ""),
+    widget.description || meta?.description || "",
+    widget.version || meta?.version || null,
+    widget.author || meta?.author || null,
+    dl.buffer.length, encrypted ? 1 : 0
+  );
+  await store.save(collectionId, dl.filename, dl.buffer);
+  return {
+    id: moduleId,
+    filename: dl.filename,
+    title: widget.title || meta?.title || dl.filename,
+    version: widget.version || meta?.version,
+    encrypted,
+  };
+}
 
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
     const files = formData.getAll("files") as File[];
+    const remoteUrl = formData.get("url") as string | null;
     const token = formData.get("token") as string | null;
     const collectionTitle = (formData.get("title") as string) || "My Widgets";
     const collectionDesc = (formData.get("description") as string) || "";
 
-    if (!files.length) {
-      return NextResponse.json({ error: "No files provided" }, { status: 400 });
+    if (!files.length && !remoteUrl) {
+      return NextResponse.json({ error: "No files or URL provided" }, { status: 400 });
     }
 
     for (const file of files) {
       if (file.size > MAX_FILE_SIZE) {
         return NextResponse.json({ error: `File ${file.name} exceeds 5MB limit` }, { status: 413 });
       }
-      if (!file.name.endsWith(".js")) {
-        return NextResponse.json({ error: `File ${file.name} is not a .js file` }, { status: 400 });
+      if (!file.name.endsWith(".js") && !file.name.endsWith(".fwd")) {
+        return NextResponse.json({ error: `File ${file.name} must be .js or .fwd` }, { status: 400 });
       }
     }
 
-    const db = getDb();
+    const db = await getBackendDb();
+    const store = await getBackendStore();
     let userId: string;
     let rawToken: string;
     let isNewUser = false;
 
     if (token) {
       const hash = hashToken(token);
-      const user = db.prepare("SELECT id FROM users WHERE token_hash = ?").get(hash) as { id: string } | undefined;
+      const user = await db.prepare("SELECT id FROM users WHERE token_hash = ?").get(hash) as { id: string } | undefined;
       if (!user) {
         return NextResponse.json({ error: "Invalid token" }, { status: 401 });
       }
@@ -46,61 +170,180 @@ export async function POST(request: NextRequest) {
       rawToken = generateToken();
       const hash = hashToken(rawToken);
       const prefix = getTokenPrefix(rawToken);
-      db.prepare("INSERT INTO users (id, token_hash, token_prefix) VALUES (?, ?, ?)").run(userId, hash, prefix);
+      await db.prepare("INSERT INTO users (id, token_hash, token_prefix) VALUES (?, ?, ?)").run(userId, hash, prefix);
       isNewUser = true;
     }
 
+    const siteUrl = process.env.SITE_URL || request.nextUrl.origin;
+    const resultBase = { ...(isNewUser ? { token: rawToken } : {}), manageUrl: `${siteUrl}/manage/${rawToken}` };
+
+    // Handle remote URL
+    if (remoteUrl) {
+      let downloaded: Awaited<ReturnType<typeof downloadRemoteFile>>;
+      try {
+        downloaded = await downloadRemoteFile(remoteUrl);
+      } catch (e) {
+        return NextResponse.json({ error: `Failed to download: ${(e as Error).message}` }, { status: 400 });
+      }
+
+      if (downloaded.isFwd) {
+        let fwd: FwdIndex;
+        try {
+          fwd = parseFwdFile(downloaded.buffer.toString("utf8"));
+        } catch (e) {
+          return NextResponse.json({ error: `Invalid .fwd content: ${(e as Error).message}` }, { status: 400 });
+        }
+
+        const collectionId = nanoid();
+        const slug = nanoid(10);
+        await db.prepare(
+          "INSERT INTO collections (id, user_id, slug, title, description, icon_url) VALUES (?, ?, ?, ?, ?, ?)"
+        ).run(collectionId, userId, slug, fwd.title || downloaded.filename, fwd.description || "", fwd.icon || "");
+        const fwdUrl = `${siteUrl}/api/collections/${slug}/fwd`;
+
+        return createProgressStream(async (send) => {
+          const allModules: ModuleInfo[] = [];
+          for (let i = 0; i < fwd.widgets.length; i++) {
+            const widget = fwd.widgets[i];
+            const fname = widget.url.split("/").pop() || "widget.js";
+            send({ type: "progress", current: i + 1, total: fwd.widgets.length, filename: fname });
+            const mod = await downloadAndStoreWidget(widget, collectionId, db, store);
+            allModules.push(mod);
+          }
+          send({ type: "result", ...resultBase, fwdUrl, modules: allModules });
+        });
+      }
+
+      // Non-.fwd remote: single .js file
+      const { buffer, filename } = downloaded;
+      const encrypted = isEncrypted(buffer);
+      const meta = encrypted ? null : parseWidgetMetadata(buffer.toString("utf8"));
+      const collectionId = nanoid();
+      const slug = nanoid(10);
+      await db.prepare("INSERT INTO collections (id, user_id, slug, title, description) VALUES (?, ?, ?, ?, ?)").run(collectionId, userId, slug, meta?.title || filename.replace(".js", ""), meta?.description || "");
+      const fwdUrl = `${siteUrl}/api/collections/${slug}/fwd`;
+      const moduleId = nanoid();
+      await db.prepare(
+        `INSERT INTO modules (id, collection_id, filename, widget_id, title, description, version, author, file_size, is_encrypted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(moduleId, collectionId, filename, meta?.id || null, meta?.title || filename.replace(".js", ""), meta?.description || "", meta?.version || null, meta?.author || null, buffer.length, encrypted ? 1 : 0);
+      await store.save(collectionId, filename, buffer);
+
+      return NextResponse.json({
+        ...resultBase, fwdUrl,
+        modules: [{ id: moduleId, filename, title: meta?.title || filename, version: meta?.version, encrypted }],
+      });
+    }
+
+    // Separate .fwd and .js files
+    const fwdFiles = files.filter((f) => f.name.endsWith(".fwd"));
+    const jsFiles = files.filter((f) => f.name.endsWith(".js"));
+
+    // If has .fwd files, use streaming response
+    if (fwdFiles.length > 0) {
+      // Pre-parse all .fwd files for validation and total count
+      const parsedFwds: { file: File; fwd: FwdIndex }[] = [];
+      let totalWidgets = 0;
+      for (const file of fwdFiles) {
+        const content = await file.text();
+        let fwd: FwdIndex;
+        try {
+          fwd = parseFwdFile(content);
+        } catch (e) {
+          return NextResponse.json({ error: `Invalid .fwd file: ${(e as Error).message}` }, { status: 400 });
+        }
+        parsedFwds.push({ file, fwd });
+        totalWidgets += fwd.widgets.length;
+      }
+
+      return createProgressStream(async (send) => {
+        const allModules: ModuleInfo[] = [];
+        let fwdUrl: string | undefined;
+        let currentWidget = 0;
+
+        for (const { file, fwd } of parsedFwds) {
+          const collectionId = nanoid();
+          const slug = nanoid(10);
+          await db.prepare(
+            "INSERT INTO collections (id, user_id, slug, title, description, icon_url) VALUES (?, ?, ?, ?, ?, ?)"
+          ).run(collectionId, userId, slug, fwd.title || file.name, fwd.description || "", fwd.icon || "");
+          fwdUrl = `${siteUrl}/api/collections/${slug}/fwd`;
+
+          for (const widget of fwd.widgets) {
+            currentWidget++;
+            const fname = widget.url.split("/").pop() || "widget.js";
+            send({ type: "progress", current: currentWidget, total: totalWidgets, filename: fname });
+            const mod = await downloadAndStoreWidget(widget, collectionId, db, store);
+            allModules.push(mod);
+          }
+        }
+
+        // Also process .js files if any
+        if (jsFiles.length > 0) {
+          const existingCollection = formData.get("collection_id") as string | null;
+          let collectionId: string;
+          if (existingCollection) {
+            const col = await db.prepare("SELECT id, slug FROM collections WHERE id = ? AND user_id = ?").get(existingCollection, userId) as { id: string; slug: string } | undefined;
+            if (!col) throw new Error("Collection not found or not owned");
+            collectionId = col.id;
+          } else {
+            collectionId = nanoid();
+            const slug = nanoid(10);
+            await db.prepare("INSERT INTO collections (id, user_id, slug, title, description) VALUES (?, ?, ?, ?, ?)").run(collectionId, userId, slug, collectionTitle, collectionDesc);
+          }
+          for (const file of jsFiles) {
+            const buffer = Buffer.from(await file.arrayBuffer());
+            const encrypted = isEncrypted(buffer);
+            const meta = encrypted ? null : parseWidgetMetadata(buffer.toString("utf8"));
+            const moduleId = nanoid();
+            await db.prepare(
+              `INSERT INTO modules (id, collection_id, filename, widget_id, title, description, version, author, file_size, is_encrypted)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(moduleId, collectionId, file.name, meta?.id || null, meta?.title || file.name.replace(".js", ""), meta?.description || "", meta?.version || null, meta?.author || null, file.size, encrypted ? 1 : 0);
+            await store.save(collectionId, file.name, buffer);
+            allModules.push({ id: moduleId, filename: file.name, title: meta?.title || file.name, version: meta?.version, encrypted });
+          }
+        }
+
+        send({ type: "result", ...resultBase, ...(fwdUrl ? { fwdUrl } : {}), modules: allModules });
+      });
+    }
+
+    // Only .js files — regular JSON response
+    const allModules: ModuleInfo[] = [];
     let collectionId: string;
-    let slug: string;
 
     const existingCollection = formData.get("collection_id") as string | null;
     if (existingCollection) {
-      const col = db.prepare("SELECT id, slug FROM collections WHERE id = ? AND user_id = ?").get(existingCollection, userId) as { id: string; slug: string } | undefined;
+      const col = await db.prepare("SELECT id, slug FROM collections WHERE id = ? AND user_id = ?").get(existingCollection, userId) as { id: string; slug: string } | undefined;
       if (!col) {
         return NextResponse.json({ error: "Collection not found or not owned" }, { status: 404 });
       }
       collectionId = col.id;
-      slug = col.slug;
     } else {
       collectionId = nanoid();
-      slug = nanoid(10);
-      db.prepare("INSERT INTO collections (id, user_id, slug, title, description) VALUES (?, ?, ?, ?, ?)").run(collectionId, userId, slug, collectionTitle, collectionDesc);
+      const slug = nanoid(10);
+      await db.prepare("INSERT INTO collections (id, user_id, slug, title, description) VALUES (?, ?, ?, ?, ?)").run(collectionId, userId, slug, collectionTitle, collectionDesc);
     }
 
-    const savedModules = [];
-    for (const file of files) {
+    for (const file of jsFiles) {
       const buffer = Buffer.from(await file.arrayBuffer());
       const encrypted = isEncrypted(buffer);
       const content = buffer.toString("utf8");
       const meta = encrypted ? null : parseWidgetMetadata(content);
-
       const moduleId = nanoid();
       const filename = file.name;
 
-      db.prepare(
+      await db.prepare(
         `INSERT INTO modules (id, collection_id, filename, widget_id, title, description, version, author, file_size, is_encrypted)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(moduleId, collectionId, filename, meta?.id || null, meta?.title || filename.replace(".js", ""), meta?.description || "", meta?.version || null, meta?.author || null, file.size, encrypted ? 1 : 0);
 
-      saveModule(collectionId, filename, buffer);
-
-      savedModules.push({
-        id: moduleId, filename, title: meta?.title || filename, version: meta?.version, encrypted,
-      });
+      await store.save(collectionId, filename, buffer);
+      allModules.push({ id: moduleId, filename, title: meta?.title || filename, version: meta?.version, encrypted });
     }
 
-    const siteUrl = process.env.SITE_URL || request.nextUrl.origin;
-
-    return NextResponse.json({
-      ...(isNewUser ? { token: rawToken } : {}),
-      manageUrl: `${siteUrl}/manage/${rawToken}`,
-      collection: {
-        id: collectionId, slug,
-        fwdUrl: `${siteUrl}/api/collections/${slug}/fwd`,
-        pageUrl: `${siteUrl}/c/${slug}`,
-      },
-      modules: savedModules,
-    });
+    return NextResponse.json({ ...resultBase, modules: allModules });
   } catch (error) {
     console.error("Upload error:", error);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });

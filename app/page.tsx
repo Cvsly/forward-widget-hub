@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
   UploadCloud,
   FileCode,
@@ -13,18 +13,67 @@ import {
   X,
   Link as LinkIcon,
   Key,
+  Globe,
+  ArrowRight,
+  ExternalLink,
+  Trash2,
+  RefreshCw,
 } from "lucide-react";
 
 interface FileItem {
   id: string;
   name: string;
   size: string;
-  type: "js" | "fwd";
+  type: "js" | "fwd" | "url";
   status: "uploading" | "processing" | "success" | "error";
   progress: number;
   url: string | null;
-  file: File;
+  fwdUrl?: string | null;
+  file: File | null;
   errorMsg?: string;
+  processingDetail?: string;
+}
+
+interface Module {
+  id: string; filename: string; title: string; description: string;
+  version: string; author: string; file_size: number; is_encrypted: number;
+}
+
+interface Collection {
+  id: string; slug: string; title: string; description: string; icon_url: string;
+  fwdUrl: string; pageUrl: string; modules: Module[];
+}
+
+async function readNdjsonStream(
+  res: Response,
+  onProgress: (detail: string) => void,
+): Promise<{ ok: boolean; data: Record<string, unknown> }> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let result: Record<string, unknown> = {};
+  let errorMsg: string | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop()!;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const evt = JSON.parse(line);
+      if (evt.type === "progress") {
+        onProgress(`正在下载 (${evt.current}/${evt.total}): ${evt.filename}`);
+      } else if (evt.type === "result") {
+        result = evt;
+      } else if (evt.type === "error") {
+        errorMsg = evt.error;
+      }
+    }
+  }
+  if (errorMsg) return { ok: false, data: { error: errorMsg } };
+  return { ok: true, data: result };
 }
 
 export default function Home() {
@@ -36,8 +85,31 @@ export default function Home() {
     }
     return null;
   });
-  const [manageUrl, setManageUrl] = useState<string | null>(null);
+  const [urlInput, setUrlInput] = useState("");
+  const [urlLoading, setUrlLoading] = useState(false);
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [collectionsLoading, setCollectionsLoading] = useState(false);
+  const [showTokenBanner, setShowTokenBanner] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const fetchCollections = useCallback(async (t?: string) => {
+    const currentToken = t || token;
+    if (!currentToken) return;
+    setCollectionsLoading(true);
+    try {
+      const res = await fetch(`/api/manage?token=${currentToken}`);
+      if (res.ok) {
+        const data = await res.json();
+        setCollections(data.collections);
+      }
+    } finally {
+      setCollectionsLoading(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (token) fetchCollections();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -48,6 +120,18 @@ export default function Home() {
     e.preventDefault();
     setIsDragging(false);
   }, []);
+
+  const onUploadSuccess = useCallback((data: Record<string, unknown>) => {
+    let newToken = token;
+    if (data.token) {
+      newToken = data.token as string;
+      setToken(newToken);
+      localStorage.setItem("fwh_token", newToken);
+      setShowTokenBanner(true);
+    }
+    // Refresh collections list
+    setTimeout(() => fetchCollections(newToken || undefined), 300);
+  }, [token, fetchCollections]);
 
   const handleFiles = useCallback(async (newFiles: File[], currentToken: string | null) => {
     const validFiles = newFiles.filter(
@@ -72,17 +156,18 @@ export default function Home() {
 
     setFiles((prev) => [...fileObjects, ...prev]);
 
-    // Upload files
     const formData = new FormData();
     validFiles.forEach((file) => formData.append("files", file));
     if (currentToken) formData.append("token", currentToken);
 
-    // Simulate progress
     const progressInterval = setInterval(() => {
       setFiles((prev) =>
         prev.map((f) => {
           if (fileObjects.some((fo) => fo.id === f.id) && f.status === "uploading") {
             const newProgress = Math.min(f.progress + Math.floor(Math.random() * 15) + 5, 90);
+            if (newProgress >= 90 && f.type === "fwd") {
+              return { ...f, status: "processing" as const, progress: 90 };
+            }
             return { ...f, progress: newProgress };
           }
           return f;
@@ -92,42 +177,58 @@ export default function Home() {
 
     try {
       const res = await fetch("/api/upload", { method: "POST", body: formData });
-      const data = await res.json();
       clearInterval(progressInterval);
+      const isStream = (res.headers.get("content-type") || "").includes("ndjson");
+      let data: Record<string, unknown>;
 
-      if (!res.ok) {
-        setFiles((prev) =>
-          prev.map((f) =>
+      if (isStream) {
+        setFiles((prev) => prev.map((f) =>
+          fileObjects.some((fo) => fo.id === f.id)
+            ? { ...f, status: "processing" as const, progress: 90, processingDetail: "正在解析依赖..." }
+            : f
+        ));
+        const streamResult = await readNdjsonStream(res, (detail) => {
+          setFiles((prev) => prev.map((f) =>
             fileObjects.some((fo) => fo.id === f.id)
-              ? { ...f, status: "error" as const, progress: 100, errorMsg: data.error }
+              ? { ...f, processingDetail: detail }
               : f
-          )
-        );
-        return;
+          ));
+        });
+        if (!streamResult.ok) {
+          setFiles((prev) => prev.map((f) =>
+            fileObjects.some((fo) => fo.id === f.id)
+              ? { ...f, status: "error" as const, progress: 100, errorMsg: (streamResult.data.error as string) || "处理失败" }
+              : f
+          ));
+          return;
+        }
+        data = streamResult.data;
+      } else {
+        data = await res.json();
+        if (!res.ok) {
+          setFiles((prev) => prev.map((f) =>
+            fileObjects.some((fo) => fo.id === f.id)
+              ? { ...f, status: "error" as const, progress: 100, errorMsg: data.error as string }
+              : f
+          ));
+          return;
+        }
       }
 
-      // Save token
-      if (data.token) {
-        setToken(data.token);
-        localStorage.setItem("fwh_token", data.token);
-      }
-      if (data.manageUrl) {
-        setManageUrl(data.manageUrl);
-      }
+      onUploadSuccess(data);
 
-      // Update file statuses
       const siteUrl = window.location.origin;
+      const modules = data.modules as { id: string; filename: string }[] | undefined;
       setFiles((prev) =>
         prev.map((f) => {
           const idx = fileObjects.findIndex((fo) => fo.id === f.id);
-          if (idx !== -1 && data.modules[idx]) {
-            const mod = data.modules[idx];
-            return {
-              ...f,
-              status: "success" as const,
-              progress: 100,
-              url: `${siteUrl}/api/modules/${mod.id}/raw`,
-            };
+          if (idx !== -1) {
+            if (f.type === "fwd" && data.fwdUrl) {
+              return { ...f, status: "success" as const, progress: 100, url: data.fwdUrl as string, fwdUrl: data.fwdUrl as string };
+            }
+            if (modules?.[idx]) {
+              return { ...f, status: "success" as const, progress: 100, url: `${siteUrl}/api/modules/${modules[idx].id}/raw` };
+            }
           }
           return f;
         })
@@ -142,7 +243,7 @@ export default function Home() {
         )
       );
     }
-  }, []);
+  }, [onUploadSuccess]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -160,11 +261,120 @@ export default function Home() {
     }
   };
 
+  const handleUrl = useCallback(async () => {
+    const url = urlInput.trim();
+    if (!url) return;
+    try { new URL(url); } catch { alert("请输入有效的 URL"); return; }
+
+    setUrlLoading(true);
+    const itemId = Math.random().toString(36).substring(7);
+    const filename = url.split("/").pop() || "remote";
+    const fileItem: FileItem = {
+      id: itemId, name: filename, size: "远程文件",
+      type: "url", status: "uploading", progress: 30, url: null, file: null,
+    };
+    setFiles((prev) => [fileItem, ...prev]);
+    setUrlInput("");
+
+    const progressInterval = setInterval(() => {
+      setFiles((prev) => prev.map((f) => {
+        if (f.id === itemId && f.status === "uploading") {
+          const newProgress = Math.min(f.progress + Math.floor(Math.random() * 10) + 3, 90);
+          if (newProgress >= 90) {
+            return { ...f, status: "processing" as const, progress: 90 };
+          }
+          return { ...f, progress: newProgress };
+        }
+        return f;
+      }));
+    }, 300);
+
+    try {
+      const formData = new FormData();
+      formData.append("url", url);
+      const currentToken = localStorage.getItem("fwh_token");
+      if (currentToken) formData.append("token", currentToken);
+
+      const res = await fetch("/api/upload", { method: "POST", body: formData });
+      clearInterval(progressInterval);
+      const isStream = (res.headers.get("content-type") || "").includes("ndjson");
+      let data: Record<string, unknown>;
+
+      if (isStream) {
+        setFiles((prev) => prev.map((f) =>
+          f.id === itemId ? { ...f, status: "processing" as const, progress: 90, processingDetail: "正在解析依赖..." } : f
+        ));
+        const streamResult = await readNdjsonStream(res, (detail) => {
+          setFiles((prev) => prev.map((f) =>
+            f.id === itemId ? { ...f, processingDetail: detail } : f
+          ));
+        });
+        if (!streamResult.ok) {
+          setFiles((prev) => prev.map((f) =>
+            f.id === itemId ? { ...f, status: "error" as const, progress: 100, errorMsg: (streamResult.data.error as string) || "处理失败" } : f
+          ));
+          return;
+        }
+        data = streamResult.data;
+      } else {
+        data = await res.json();
+        if (!res.ok) {
+          setFiles((prev) => prev.map((f) =>
+            f.id === itemId ? { ...f, status: "error" as const, progress: 100, errorMsg: data.error as string } : f
+          ));
+          return;
+        }
+      }
+
+      onUploadSuccess(data);
+
+      if (data.fwdUrl) {
+        const modules = data.modules as { filename: string }[] | undefined;
+        setFiles((prev) => prev.map((f) =>
+          f.id === itemId ? { ...f, status: "success" as const, progress: 100, url: data.fwdUrl as string, fwdUrl: data.fwdUrl as string, name: modules?.[0]?.filename || filename, type: "fwd" as const } : f
+        ));
+      } else if ((data.modules as { id: string; filename: string }[])?.length === 1) {
+        const siteUrl = window.location.origin;
+        const mod = (data.modules as { id: string; filename: string }[])[0];
+        setFiles((prev) => prev.map((f) =>
+          f.id === itemId ? { ...f, status: "success" as const, progress: 100, url: `${siteUrl}/api/modules/${mod.id}/raw`, name: mod.filename } : f
+        ));
+      }
+    } catch {
+      clearInterval(progressInterval);
+      setFiles((prev) => prev.map((f) =>
+        f.id === itemId ? { ...f, status: "error" as const, progress: 100, errorMsg: "网络错误" } : f
+      ));
+    } finally {
+      setUrlLoading(false);
+    }
+  }, [urlInput, onUploadSuccess]);
+
   const removeFile = (id: string) => {
     setFiles((prev) => prev.filter((f) => f.id !== id));
   };
 
-  const currentManageUrl = manageUrl || (token ? `${typeof window !== "undefined" ? window.location.origin : ""}/manage/${token}` : null);
+  const handleDeleteModule = async (moduleId: string) => {
+    if (!confirm("确定删除此模块？")) return;
+    const res = await fetch(`/api/modules/${moduleId}?token=${token}`, { method: "DELETE" });
+    if (res.ok) fetchCollections();
+  };
+
+  const handleDeleteCollection = async (slug: string, title: string) => {
+    if (!confirm(`确定删除整个合集「${title}」及其所有模块？`)) return;
+    const res = await fetch(`/api/collections/${slug}?token=${token}`, { method: "DELETE" });
+    if (res.ok) fetchCollections();
+  };
+
+  const handleLogout = () => {
+    const url = `${window.location.origin}/manage/${token}`;
+    if (!confirm(`退出后需通过管理链接恢复访问，请确认已保存：\n\n${url}`)) return;
+    setToken(null);
+    setCollections([]);
+    localStorage.removeItem("fwh_token");
+  };
+
+  const manageUrl = token ? `${typeof window !== "undefined" ? window.location.origin : ""}/manage/${token}` : null;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8 font-sans">
@@ -176,95 +386,126 @@ export default function Home() {
           </h1>
           <p className="text-slate-500 max-w-lg mx-auto">
             上传您的{" "}
-            <code className="bg-slate-200 px-1.5 py-0.5 rounded text-sm text-slate-700">
-              .js
-            </code>{" "}
+            <code className="bg-slate-200 px-1.5 py-0.5 rounded text-sm text-slate-700">.js</code>{" "}
             或{" "}
-            <code className="bg-slate-200 px-1.5 py-0.5 rounded text-sm text-indigo-600">
-              .fwd
-            </code>{" "}
-            文件以获取云端托管地址。系统会自动解析 .fwd
-            文件并替换其内部引用的依赖链接。
+            <code className="bg-slate-200 px-1.5 py-0.5 rounded text-sm text-indigo-600">.fwd</code>{" "}
+            文件以获取云端托管地址。系统会自动解析 .fwd 文件并替换其内部引用的依赖链接。
           </p>
         </div>
 
         {/* Upload Area */}
         <div
           className={`relative border-2 border-dashed rounded-2xl p-10 md:p-16 text-center transition-all duration-200 ease-in-out cursor-pointer bg-white
-            ${
-              isDragging
-                ? "border-indigo-500 bg-indigo-50 shadow-inner"
-                : "border-slate-300 hover:border-indigo-400 hover:bg-slate-50"
-            }
+            ${isDragging ? "border-indigo-500 bg-indigo-50 shadow-inner" : "border-slate-300 hover:border-indigo-400 hover:bg-slate-50"}
           `}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           onClick={() => fileInputRef.current?.click()}
         >
-          <input
-            type="file"
-            ref={fileInputRef}
-            onChange={handleFileInput}
-            className="hidden"
-            multiple
-            accept=".js,.fwd"
-          />
+          <input type="file" ref={fileInputRef} onChange={handleFileInput} className="hidden" multiple accept=".js,.fwd" />
           <div className="flex flex-col items-center justify-center space-y-4">
-            <div
-              className={`p-4 rounded-full ${
-                isDragging ? "bg-indigo-100" : "bg-slate-100"
-              }`}
-            >
-              <UploadCloud
-                className={`w-10 h-10 ${
-                  isDragging ? "text-indigo-600" : "text-slate-400"
-                }`}
-              />
+            <div className={`p-4 rounded-full ${isDragging ? "bg-indigo-100" : "bg-slate-100"}`}>
+              <UploadCloud className={`w-10 h-10 ${isDragging ? "text-indigo-600" : "text-slate-400"}`} />
             </div>
             <div>
-              <p className="text-lg font-medium text-slate-700">
-                点击或将文件拖拽至此处
-              </p>
-              <p className="text-sm text-slate-400 mt-1">
-                支持 .js, .fwd 文件 (最大 5MB)
-              </p>
+              <p className="text-lg font-medium text-slate-700">点击或将文件拖拽至此处</p>
+              <p className="text-sm text-slate-400 mt-1">支持 .js, .fwd 文件 (最大 5MB)</p>
             </div>
           </div>
         </div>
 
-        {/* File List */}
+        {/* URL Input */}
+        <div className="flex items-center gap-3 bg-white border border-slate-200 rounded-xl p-3 shadow-sm">
+          <Globe className="w-5 h-5 text-slate-400 flex-shrink-0" />
+          <input
+            type="text"
+            value={urlInput}
+            onChange={(e) => setUrlInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleUrl(); }}
+            placeholder="输入 .js 或 .fwd 文件的 URL 直接转存"
+            className="flex-1 text-sm text-slate-700 placeholder:text-slate-400 focus:outline-none bg-transparent"
+          />
+          <button
+            onClick={handleUrl}
+            disabled={urlLoading || !urlInput.trim()}
+            className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+          >
+            {urlLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
+            转存
+          </button>
+        </div>
+
+        {/* Upload Progress List */}
         {files.length > 0 && (
-          <div className="space-y-6">
-            {/* Management Link */}
-            {currentManageUrl && (
-              <ManageLinkBanner url={currentManageUrl} />
-            )}
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center">
+              <h2 className="text-lg font-semibold text-slate-800">上传列表 ({files.length})</h2>
+              <button onClick={() => setFiles([])} className="text-sm text-slate-500 hover:text-slate-700 transition-colors">清空</button>
+            </div>
+            <div className="divide-y divide-slate-100 max-h-[400px] overflow-y-auto">
+              {files.map((file) => (
+                <FileItemRow key={file.id} file={file} onRemove={() => removeFile(file.id)} />
+              ))}
+            </div>
+          </div>
+        )}
 
-            {/* List */}
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-              <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center">
-                <h2 className="text-lg font-semibold text-slate-800">
-                  上传列表 ({files.length})
-                </h2>
-                <button
-                  onClick={() => setFiles([])}
-                  className="text-sm text-slate-500 hover:text-slate-700 transition-colors"
-                >
-                  清空全部
-                </button>
+        {/* Token Banner */}
+        {showTokenBanner && manageUrl && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-5 relative">
+            <button onClick={() => setShowTokenBanner(false)} className="absolute top-3 right-3 p-1 text-amber-400 hover:text-amber-600 rounded transition-colors">
+              <X className="w-4 h-4" />
+            </button>
+            <div className="flex items-start gap-3">
+              <div className="p-2 bg-amber-100 rounded-lg flex-shrink-0">
+                <Key className="w-5 h-5 text-amber-600" />
               </div>
-
-              <div className="divide-y divide-slate-100 max-h-[500px] overflow-y-auto">
-                {files.map((file) => (
-                  <FileItemRow
-                    key={file.id}
-                    file={file}
-                    onRemove={() => removeFile(file.id)}
-                  />
-                ))}
+              <div className="space-y-2 min-w-0">
+                <h3 className="text-sm font-semibold text-amber-900">请保存您的管理链接</h3>
+                <p className="text-xs text-amber-700">这是您管理已上传模块的唯一凭证。丢失后将无法找回，请务必妥善保存。</p>
+                <div className="flex items-center bg-white border border-amber-200 rounded-md p-0.5">
+                  <input type="text" readOnly value={manageUrl} className="bg-transparent text-xs font-mono text-amber-800 w-full focus:outline-none truncate px-2" />
+                  <CopyButton text={manageUrl} label="复制" />
+                </div>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Collections Management */}
+        {token && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-bold text-slate-900">我的合集</h2>
+              <div className="flex items-center gap-2">
+                {manageUrl && <CopyButton text={manageUrl} label="复制管理链接" />}
+                <button onClick={handleLogout} className="text-xs flex items-center gap-1 px-2 py-1 rounded-md bg-slate-100 text-slate-500 hover:bg-red-50 hover:text-red-600 transition-colors">
+                  退出登录
+                </button>
+              </div>
+            </div>
+
+            {collectionsLoading && collections.length === 0 && (
+              <div className="text-center py-8">
+                <Loader2 className="w-5 h-5 animate-spin text-slate-400 mx-auto" />
+              </div>
+            )}
+
+            {!collectionsLoading && collections.length === 0 && (
+              <div className="text-center py-8 text-slate-400 text-sm">暂无合集</div>
+            )}
+
+            {collections.map((col) => (
+              <CollectionSection
+                key={col.id}
+                collection={col}
+                token={token!}
+                onDeleteModule={handleDeleteModule}
+                onDeleteCollection={() => handleDeleteCollection(col.slug, col.title)}
+                onRefresh={fetchCollections}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -272,57 +513,168 @@ export default function Home() {
   );
 }
 
-function ManageLinkBanner({ url }: { url: string }) {
+function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
-
   const handleCopy = () => {
-    navigator.clipboard.writeText(url).then(() => {
+    navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
   };
+  return (
+    <button
+      onClick={handleCopy}
+      className={`text-xs flex items-center gap-1 px-2 py-1 rounded-md transition-all ${copied ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600 hover:bg-slate-200"}`}
+      title={label}
+    >
+      {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+      {copied ? "已复制" : label}
+    </button>
+  );
+}
+
+function CollectionSection({ collection, token, onDeleteModule, onDeleteCollection, onRefresh }: {
+  collection: Collection;
+  token: string;
+  onDeleteModule: (id: string) => void;
+  onDeleteCollection: () => void;
+  onRefresh: () => void;
+}) {
+  const [copiedFwd, setCopiedFwd] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [replacingId, setReplacingId] = useState<string | null>(null);
+
+  const handleReplace = async (moduleId: string, e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setReplacingId(moduleId);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch(`/api/modules/${moduleId}?token=${token}`, { method: "PUT", body: formData });
+      if (res.ok) onRefresh();
+    } finally {
+      setReplacingId(null);
+      e.target.value = "";
+    }
+  };
+
+  const handleUploadMore = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setIsUploading(true);
+    try {
+      const formData = new FormData();
+      files.forEach((file) => formData.append("files", file));
+      formData.append("token", token);
+      formData.append("collection_id", collection.id);
+      const res = await fetch("/api/upload", { method: "POST", body: formData });
+      if (res.ok) onRefresh();
+    } finally {
+      setIsUploading(false);
+      e.target.value = "";
+    }
+  };
 
   return (
-    <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-      <div>
-        <h3 className="text-sm font-semibold text-indigo-900 flex items-center gap-2">
-          <Key className="w-4 h-4" />
-          管理链接
-        </h3>
-        <p className="text-xs text-indigo-700 mt-1 max-w-lg">
-          请妥善保存此管理链接。它是您后续修改或删除已上传模块的唯一入口。
-        </p>
+    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+      {/* Header */}
+      <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50">
+        <div className="flex items-start justify-between">
+          <div className="flex items-center gap-3">
+            {collection.icon_url ? (
+              <img src={collection.icon_url} alt="" className="w-9 h-9 rounded-lg object-cover" />
+            ) : (
+              <div className="w-9 h-9 rounded-lg bg-indigo-50 flex items-center justify-center">
+                <FileJson className="w-4.5 h-4.5 text-indigo-600" />
+              </div>
+            )}
+            <div>
+              <h3 className="font-semibold text-slate-800">{collection.title}</h3>
+              {collection.description && <p className="text-xs text-slate-500">{collection.description}</p>}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <span className="text-xs text-slate-500 bg-slate-100 px-2 py-1 rounded-md">{collection.modules.length} 个模块</span>
+            <button onClick={onDeleteCollection} className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors" title="删除合集">
+              <Trash2 className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
       </div>
-      <div className="flex items-center bg-white border border-indigo-200 rounded-lg p-1 w-full sm:w-auto shadow-sm">
-        <input
-          type="text"
-          readOnly
-          value={url}
-          className="bg-transparent text-sm font-mono text-indigo-600 w-full sm:w-80 focus:outline-none truncate px-2"
-        />
+
+      {/* FWD Link */}
+      <div className="px-6 py-2.5 bg-indigo-50/50 border-b border-slate-100 flex items-center gap-2">
+        <Key className="w-3.5 h-3.5 text-indigo-500 flex-shrink-0" />
+        <span className="text-xs text-indigo-700 font-medium flex-shrink-0">订阅链接</span>
+        <div className="flex items-center bg-white border border-indigo-200 rounded-md p-0.5 flex-1 min-w-0">
+          <input type="text" readOnly value={collection.fwdUrl} className="bg-transparent text-xs font-mono text-indigo-600 w-full focus:outline-none truncate px-2" />
+          <button
+            onClick={() => { navigator.clipboard.writeText(collection.fwdUrl); setCopiedFwd(true); setTimeout(() => setCopiedFwd(false), 2000); }}
+            className={`p-1 rounded transition-all flex-shrink-0 ${copiedFwd ? "bg-green-500 text-white" : "bg-indigo-50 text-indigo-600 hover:bg-indigo-100"}`}
+          >
+            {copiedFwd ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+      </div>
+
+      {/* Modules */}
+      <div className="divide-y divide-slate-100">
+        {collection.modules.map((mod) => (
+          <div key={mod.id} className="px-6 py-3 flex items-center justify-between gap-4 hover:bg-slate-50 transition-colors group">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="p-2 rounded-lg bg-amber-50 text-amber-600 flex-shrink-0">
+                <FileCode className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-sm text-slate-800 truncate">{mod.title}</span>
+                  {mod.version && <span className="text-xs bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">{mod.version}</span>}
+                  {mod.is_encrypted ? <span className="text-xs bg-purple-50 text-purple-600 px-1.5 py-0.5 rounded border border-purple-100">加密</span> : null}
+                </div>
+                <p className="text-xs text-slate-400">{mod.filename} · {mod.file_size < 1024 ? `${mod.file_size} B` : `${(mod.file_size / 1024).toFixed(1)} KB`}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 flex-shrink-0">
+              <input type="file" accept=".js" className="hidden" id={`replace-${mod.id}`} onChange={(e) => handleReplace(mod.id, e)} />
+              <button
+                disabled={replacingId === mod.id}
+                onClick={() => document.getElementById(`replace-${mod.id}`)?.click()}
+                className="text-xs text-indigo-600 hover:text-indigo-800 transition-colors disabled:opacity-50"
+              >
+                {replacingId === mod.id ? "上传中..." : "更新版本"}
+              </button>
+              <button
+                onClick={() => onDeleteModule(mod.id)}
+                className="text-xs text-slate-400 hover:text-red-500 transition-colors"
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+        {collection.modules.length === 0 && (
+          <div className="px-6 py-4 text-center text-sm text-slate-400">暂无模块</div>
+        )}
+      </div>
+
+      {/* Add more modules */}
+      <div className="px-6 py-3 border-t border-slate-100 bg-slate-50/30">
+        <input type="file" accept=".js" multiple className="hidden" id={`upload-${collection.id}`} onChange={handleUploadMore} />
         <button
-          onClick={handleCopy}
-          className={`p-1.5 rounded-md transition-all flex-shrink-0 ${
-            copied
-              ? "bg-green-500 text-white"
-              : "bg-indigo-50 text-indigo-600 hover:bg-indigo-100"
-          }`}
-          title="复制管理链接"
+          disabled={isUploading}
+          onClick={() => document.getElementById(`upload-${collection.id}`)?.click()}
+          className="flex items-center gap-2 text-sm text-slate-500 hover:text-indigo-600 transition-colors disabled:opacity-50"
         >
-          {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+          {isUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <UploadCloud className="w-4 h-4" />}
+          {isUploading ? "上传中..." : "添加模块"}
         </button>
       </div>
     </div>
   );
 }
 
-function FileItemRow({
-  file,
-  onRemove,
-}: {
-  file: FileItem;
-  onRemove: () => void;
-}) {
+function FileItemRow({ file, onRemove }: { file: FileItem; onRemove: () => void }) {
   const [copiedUrl, setCopiedUrl] = useState(false);
 
   const handleCopy = (text: string) => {
@@ -335,114 +687,66 @@ function FileItemRow({
   return (
     <div className="p-4 sm:p-6 hover:bg-slate-50 transition-colors group">
       <div className="flex items-start sm:items-center justify-between gap-4 flex-col sm:flex-row">
-        {/* Left: Icon and info */}
         <div className="flex items-center gap-4 w-full sm:w-auto">
-          <div
-            className={`p-3 rounded-xl flex-shrink-0 ${
-              file.type === "fwd"
-                ? "bg-indigo-50 text-indigo-600"
-                : "bg-amber-50 text-amber-600"
-            }`}
-          >
-            {file.type === "fwd" ? (
-              <FileJson className="w-6 h-6" />
-            ) : (
-              <FileCode className="w-6 h-6" />
-            )}
+          <div className={`p-3 rounded-xl flex-shrink-0 ${file.type === "fwd" ? "bg-indigo-50 text-indigo-600" : file.type === "url" ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>
+            {file.type === "fwd" ? <FileJson className="w-6 h-6" /> : file.type === "url" ? <Globe className="w-6 h-6" /> : <FileCode className="w-6 h-6" />}
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <p
-                className="font-medium text-slate-800 truncate"
-                title={file.name}
-              >
-                {file.name}
-              </p>
-              {file.type === "fwd" && (
-                <span className="px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-700 border border-indigo-200">
-                  自动解析
-                </span>
-              )}
+              <p className="font-medium text-slate-800 truncate" title={file.name}>{file.name}</p>
+              {file.type === "fwd" && <span className="px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-700 border border-indigo-200">自动解析</span>}
             </div>
             <p className="text-xs text-slate-400 mt-0.5">{file.size}</p>
           </div>
         </div>
 
-        {/* Right: Status */}
         <div className="flex items-center gap-4 w-full sm:w-auto justify-between sm:justify-end">
           {file.status === "uploading" && (
             <div className="flex items-center gap-3 w-full sm:w-48">
               <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-blue-500 transition-all duration-200 ease-out rounded-full"
-                  style={{ width: `${file.progress}%` }}
-                />
+                <div className="h-full bg-blue-500 transition-all duration-200 ease-out rounded-full" style={{ width: `${file.progress}%` }} />
               </div>
-              <span className="text-sm text-slate-500 w-10 text-right">
-                {file.progress}%
-              </span>
+              <span className="text-sm text-slate-500 w-10 text-right">{file.progress}%</span>
             </div>
           )}
 
           {file.status === "processing" && (
             <div className="flex items-center gap-2 text-indigo-600">
               <Loader2 className="w-4 h-4 animate-spin" />
-              <span className="text-sm font-medium">解析内嵌依赖...</span>
+              <span className="text-sm font-medium truncate max-w-[300px]">
+                {file.processingDetail || "正在处理..."}
+              </span>
             </div>
           )}
 
           {file.status === "error" && (
             <div className="flex items-center gap-2 text-red-500">
               <AlertCircle className="w-4 h-4" />
-              <span className="text-sm font-medium">
-                {file.errorMsg || "上传失败"}
-              </span>
+              <span className="text-sm font-medium">{file.errorMsg || "上传失败"}</span>
             </div>
           )}
 
           {file.status === "success" && file.url && (
-            <div className="flex flex-col gap-2 w-full sm:w-auto mt-2 sm:mt-0">
-              <div className="flex items-center gap-2 justify-between sm:justify-end">
-                <div className="hidden sm:flex items-center gap-1.5 bg-green-50 text-green-700 px-2 py-1 rounded border border-green-100">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span className="text-xs font-medium">托管成功</span>
-                </div>
-                <div className="flex items-center bg-slate-100 rounded-md p-1 w-full sm:w-[220px]">
-                  <div className="p-1 text-slate-400">
-                    <LinkIcon className="w-3.5 h-3.5" />
-                  </div>
-                  <input
-                    type="text"
-                    readOnly
-                    value={file.url}
-                    className="bg-transparent text-xs text-slate-600 w-full focus:outline-none truncate px-1"
-                  />
-                  <button
-                    onClick={() => handleCopy(file.url!)}
-                    className={`p-1.5 rounded transition-all flex-shrink-0 ${
-                      copiedUrl
-                        ? "bg-green-500 text-white"
-                        : "bg-white text-slate-600 hover:bg-slate-200 shadow-sm"
-                    }`}
-                    title="复制链接"
-                  >
-                    {copiedUrl ? (
-                      <Check className="w-3.5 h-3.5" />
-                    ) : (
-                      <Copy className="w-3.5 h-3.5" />
-                    )}
-                  </button>
-                </div>
+            <div className="flex items-center gap-2 justify-between sm:justify-end">
+              <div className={`hidden sm:flex items-center gap-1.5 px-2 py-1 rounded border ${file.fwdUrl ? "bg-indigo-50 text-indigo-700 border-indigo-100" : "bg-green-50 text-green-700 border-green-100"}`}>
+                {file.fwdUrl ? <FileJson className="w-3.5 h-3.5" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                <span className="text-xs font-medium">{file.fwdUrl ? "订阅链接" : "托管成功"}</span>
+              </div>
+              <div className="flex items-center bg-slate-100 rounded-md p-1 w-full sm:w-[220px]">
+                <div className="p-1 text-slate-400"><LinkIcon className="w-3.5 h-3.5" /></div>
+                <input type="text" readOnly value={file.url} className="bg-transparent text-xs text-slate-600 w-full focus:outline-none truncate px-1" />
+                <button
+                  onClick={() => handleCopy(file.url!)}
+                  className={`p-1.5 rounded transition-all flex-shrink-0 ${copiedUrl ? "bg-green-500 text-white" : "bg-white text-slate-600 hover:bg-slate-200 shadow-sm"}`}
+                  title="复制链接"
+                >
+                  {copiedUrl ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
               </div>
             </div>
           )}
 
-          {/* Delete button */}
-          <button
-            onClick={onRemove}
-            className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
-            title="移除记录"
-          >
+          <button onClick={onRemove} className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100" title="移除记录">
             <X className="w-4 h-4" />
           </button>
         </div>

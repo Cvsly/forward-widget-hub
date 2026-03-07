@@ -1,4 +1,4 @@
-import { getDb } from "@/lib/db";
+import { getBackendDb } from "@/lib/backend";
 import { notFound } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { APP_NAME } from "@/lib/constants";
@@ -11,12 +11,12 @@ interface Module {
 
 export default async function CollectionPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const db = getDb();
+  const db = await getBackendDb();
 
-  const collection = db.prepare("SELECT * FROM collections WHERE slug = ?").get(slug) as Record<string, any> | undefined;
+  const collection = await db.prepare("SELECT * FROM collections WHERE slug = ?").get(slug) as Record<string, any> | undefined;
   if (!collection) notFound();
 
-  const modules = db.prepare("SELECT * FROM modules WHERE collection_id = ? ORDER BY created_at").all(collection.id) as Module[];
+  const modules = await db.prepare("SELECT * FROM modules WHERE collection_id = ? ORDER BY created_at").all(collection.id) as Module[];
   const siteUrl = process.env.SITE_URL || "";
   const fwdUrl = `${siteUrl}/api/collections/${slug}/fwd`;
 

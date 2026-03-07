@@ -1,93 +1,149 @@
 # Forward Widget Hub
 
-A self-hosted platform for uploading and hosting [ForwardWidget](https://github.com/user/ForwardWidgets) modules. Upload your `.js` widget files and get a shareable `.fwd` subscription link for [Forward App](https://apps.apple.com/app/forward/id1490153115).
+自托管的 [Forward App](https://apps.apple.com/app/id6503940939) 模块托管平台。上传 `.js` 小组件或 `.fwd` 订阅文件，自动生成可在 Forward App 中导入的订阅链接。
 
-## Features
+## 功能特性
 
-- Drag-and-drop upload for `.js` widget modules
-- Automatic `WidgetMetadata` parsing and validation
-- Token-based management (no registration required)
-- `.fwd` subscription link generation for Forward App
-- Support for encrypted modules (FWENC1 format)
-- SQLite database + local file storage
-- Single Docker container deployment
-- Dark/light theme support
+- **拖拽上传** — 支持 `.js` 和 `.fwd` 文件的拖拽或点击上传
+- **URL 转存** — 粘贴远程 `.js` / `.fwd` 链接，一键转存到平台
+- **自动解析 .fwd** — 自动下载 `.fwd` 中引用的所有依赖模块并转存
+- **元数据识别** — 从 JS 文件中自动解析 `WidgetMetadata`（标题、版本、作者等）
+- **加密模块支持** — 自动识别 FWENC1 加密格式
+- **合集管理** — 模块自动归入合集，支持增删改查和版本更新
+- **订阅链接** — 每个合集自动生成 `.fwd` 订阅链接，Forward App 可直接导入
+- **无需注册** — 首次上传自动生成管理令牌，凭链接即可管理
 
-## Quick Start
+## 部署方式
 
-### Docker (Recommended)
+支持两种部署方式，任选其一：
+
+| | Cloudflare | Docker |
+|---|---|---|
+| 存储 | D1 + R2 | SQLite + 本地文件 |
+| 费用 | 免费额度内零成本 | 需要自备服务器 |
+| 适合 | 无服务器、想省事 | 有服务器、想完全自控 |
+
+---
+
+### 方式一：一键部署到 Cloudflare
+
+点击下方按钮，按提示授权 Cloudflare 和 GitHub 账号即可完成部署，无需任何手动配置：
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/InchStudio/forward-widget-hub)
+
+> 部署过程会自动创建所需的 D1 数据库和 R2 存储桶，并初始化数据表。后续每次推送到 `main` 分支都会自动重新部署。
+
+---
+
+### 方式二：Docker 部署
+
+#### 1. 克隆项目
 
 ```bash
-docker run -d \
-  -p 3000:3000 \
-  -v ./data:/data \
-  -e SITE_URL=https://your-domain.com \
-  forward-widget-hub
+git clone https://github.com/InchStudio/forward-widget-hub.git
+cd forward-widget-hub
 ```
 
-### Docker Compose
+#### 2. 启动服务
 
 ```bash
-git clone https://github.com/user/forward-widget-hub.git
-cd forward-widget-hub
 docker compose up -d
 ```
 
-### Development
+启动完成后访问 http://localhost:3000 即可使用。
+
+#### 3. 使用自定义域名
+
+如果你有域名（比如 `https://widget.example.com`），需要修改 `docker-compose.yml` 中的 `SITE_URL`，让生成的链接指向正确的地址：
+
+```yaml
+services:
+  forward-widget-hub:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+    environment:
+      - SITE_URL=https://widget.example.com
+    restart: unless-stopped
+```
+
+然后重新启动：
 
 ```bash
-npm install
-npm run dev
+docker compose up -d --build
 ```
 
-Open http://localhost:3000
+#### 4. 配置 HTTPS（推荐）
 
-## Environment Variables
+用 Nginx 做反向代理，加上 SSL 证书：
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SITE_URL` | `http://localhost:3000` | Public URL for generating links |
-| `DATA_DIR` | `./data` | Directory for SQLite database and module files |
-| `PORT` | `3000` | Server port |
+```nginx
+server {
+    listen 443 ssl;
+    server_name widget.example.com;
 
-## How It Works
+    ssl_certificate     /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
 
-1. **Upload**: Drag `.js` widget files to the upload zone
-2. **Get Token**: First upload generates a management token - save it!
-3. **Share**: Copy the `.fwd` subscription link
-4. **Import**: Add the link in Forward App to import your widgets
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 10m;
+    }
+}
+```
 
-## API
+#### 数据备份
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/upload` | Upload widget files |
-| `GET` | `/api/collections/:slug` | Get collection info |
-| `GET` | `/api/collections/:slug/fwd` | Get `.fwd` index for Forward App |
-| `GET` | `/api/modules/:id/raw` | Download raw module file |
-| `GET` | `/api/manage?token=xxx` | List your collections |
-| `DELETE` | `/api/modules/:id?token=xxx` | Delete a module |
-
-## Data Storage
-
-All data is stored in the `/data` volume:
+所有数据存储在项目根目录的 `./data` 文件夹中，备份只需复制这个文件夹：
 
 ```
-/data/
-├── db.sqlite          # SQLite database
+data/
+├── db.sqlite           # 数据库
 └── modules/
     └── <collection>/
-        └── widget.js  # Module files
+        └── widget.js   # 模块文件
 ```
 
-Backup: just copy the `/data` directory.
+## 使用方式
 
-## Security
+1. **上传模块** — 将 `.js` 文件拖入上传区域，或粘贴远程链接点击「转存」
+2. **保存令牌** — 首次上传会生成管理链接，**务必保存**（丢失无法找回）
+3. **复制订阅链接** — 上传成功后复制生成的 `.fwd` 订阅链接
+4. **导入 Forward** — 在 Forward App 中粘贴订阅链接即可导入
 
-- Tokens are SHA-256 hashed before storage
-- Rate limiting: 10 auth requests/min per IP, 15-min lockout after 5 failures
-- Module files are served as-is (no server-side execution)
-- WidgetMetadata is parsed with regex, never eval'd
+## .fwd 文件格式
+
+`.fwd` 是一个 JSON 文件，定义了一组小组件的集合。上传后平台会自动下载所有引用的 `.js` 文件并转存：
+
+```json
+{
+  "title": "我的小组件合集",
+  "description": "一些实用的小组件",
+  "icon": "https://example.com/icon.png",
+  "widgets": [
+    {
+      "title": "天气组件",
+      "version": "1.0.0",
+      "url": "https://example.com/weather.js"
+    },
+    {
+      "title": "日历组件",
+      "url": "https://example.com/calendar.js"
+    }
+  ]
+}
+```
+
+## 技术栈
+
+- [Next.js](https://nextjs.org/) 16 + React 19
+- [Tailwind CSS](https://tailwindcss.com/) 4
+- SQLite / Cloudflare D1（数据库）
+- 本地文件系统 / Cloudflare R2（文件存储）
 
 ## License
 

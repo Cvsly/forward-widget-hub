@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDb } from "@/lib/db";
+import { getBackendDb } from "@/lib/backend";
 
 interface ModuleRow {
   id: string; filename: string; widget_id: string | null; title: string | null;
@@ -10,12 +10,17 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ slug: string }> }
 ) {
+  const ua = request.headers.get("user-agent") || "";
+  if (!ua.includes("Forward")) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
   const { slug } = await params;
-  const db = getDb();
-  const collection = db.prepare("SELECT * FROM collections WHERE slug = ?").get(slug) as Record<string, unknown> | undefined;
+  const db = await getBackendDb();
+  const collection = await db.prepare("SELECT * FROM collections WHERE slug = ?").get(slug) as Record<string, unknown> | undefined;
   if (!collection) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const modules = db.prepare(
+  const modules = await db.prepare(
     "SELECT id, filename, widget_id, title, description, version, author, file_size FROM modules WHERE collection_id = ? ORDER BY created_at"
   ).all(collection.id) as ModuleRow[];
 
@@ -35,5 +40,10 @@ export async function GET(
     })),
   };
 
-  return NextResponse.json(fwd);
+  return NextResponse.json(fwd, {
+    headers: {
+      "Cache-Control": "public, max-age=3600",
+      "Vary": "User-Agent",
+    },
+  });
 }
