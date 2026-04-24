@@ -17,22 +17,25 @@ let _initPromise: Promise<void> | null = null;
 
 function isAlreadyExistsError(e: unknown): boolean {
   const msg = String((e as { message?: string })?.message ?? e);
-  return /already exists/i.test(msg);
+  return /already exists|incomplete input/i.test(msg);
 }
 
 async function ensureSchema(d1: D1Database): Promise<void> {
-  // Split schema into individual statements — D1 exec may not handle multi-statement strings
   const statements = SCHEMA
     .split(";")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
   for (const sql of statements) {
-    try { await d1.exec(sql + ";"); } catch (e) {
+    try {
+      await d1.prepare(sql).run();
+    } catch (e) {
       if (!isAlreadyExistsError(e)) throw e;
     }
   }
   for (const sql of MIGRATIONS) {
-    try { await d1.exec(sql); } catch (e) {
+    try {
+      await d1.prepare(sql).run();
+    } catch (e) {
       if (!isAlreadyExistsError(e)) throw e;
     }
   }
@@ -43,7 +46,7 @@ export function createD1Db(binding: unknown): Db {
 
   if (!_initPromise) {
     _initPromise = ensureSchema(d1).catch((e) => {
-      _initPromise = null; // allow retry on next request
+      _initPromise = null;
       throw e;
     });
   }
