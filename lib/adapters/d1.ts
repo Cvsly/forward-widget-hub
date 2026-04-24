@@ -17,7 +17,7 @@ let _initPromise: Promise<void> | null = null;
 
 function isAlreadyExistsError(e: unknown): boolean {
   const msg = String((e as { message?: string })?.message ?? e);
-  return /already exists|incomplete input/i.test(msg);
+  return /already exists|incomplete input|duplicate column/i.test(msg);
 }
 
 async function ensureSchema(d1: D1Database): Promise<void> {
