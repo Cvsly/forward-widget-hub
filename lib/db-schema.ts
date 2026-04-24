@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS users (
   token_hash TEXT UNIQUE NOT NULL,
   token_prefix TEXT NOT NULL,
   name TEXT,
-  created_at INTEGER DEFAULT (strftime('%s', 'now'))
+  created_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -15,8 +15,8 @@ CREATE TABLE IF NOT EXISTS collections (
   description TEXT DEFAULT '',
   icon_url TEXT DEFAULT '',
   source_url TEXT,
-  created_at INTEGER DEFAULT (strftime('%s', 'now')),
-  updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+  created_at INTEGER,
+  updated_at INTEGER,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -34,8 +34,8 @@ CREATE TABLE IF NOT EXISTS modules (
   is_encrypted INTEGER DEFAULT 0,
   source_url TEXT,
   oss_key TEXT,
-  created_at INTEGER DEFAULT (strftime('%s', 'now')),
-  updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+  created_at INTEGER,
+  updated_at INTEGER,
   FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
 );
 
@@ -50,6 +50,11 @@ export const MIGRATIONS = [
   `ALTER TABLE collections ADD COLUMN source_url TEXT;`,
   `ALTER TABLE modules ADD COLUMN source_url TEXT;`,
   `ALTER TABLE modules ADD COLUMN oss_key TEXT;`,
+  `ALTER TABLE users ADD COLUMN created_at INTEGER DEFAULT (strftime('%s', 'now'));`,
+  `ALTER TABLE collections ADD COLUMN created_at INTEGER DEFAULT (strftime('%s', 'now'));`,
+  `ALTER TABLE collections ADD COLUMN updated_at INTEGER DEFAULT (strftime('%s', 'now'));`,
+  `ALTER TABLE modules ADD COLUMN created_at INTEGER DEFAULT (strftime('%s', 'now'));`,
+  `ALTER TABLE modules ADD COLUMN updated_at INTEGER DEFAULT (strftime('%s', 'now'));`,
 ];
 
 export function applyMigrations(exec: (sql: string) => void) {
