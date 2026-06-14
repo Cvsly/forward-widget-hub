@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getBackendDb, getBackendStore } from "@/lib/backend";
+import { parseWidgetMetadata } from "@/lib/parser";
 
 interface ModuleRow {
   id: string; collection_id: string; filename: string; widget_id: string | null; title: string | null;
@@ -12,11 +13,6 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ slug: string }> }
 ) {
-  const ua = request.headers.get("user-agent") || "";
-  if (!ua.includes("Forward")) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
-
   const { slug } = await params;
   const db = await getBackendDb();
   const collection = await db.prepare("SELECT * FROM collections WHERE slug = ?").get(slug) as Record<string, unknown> | undefined;
@@ -31,12 +27,22 @@ export async function GET(
   const host = request.headers.get("host") || request.nextUrl.host;
   const siteUrl = `${proto}://${host}`;
 
-  const fwd = {
-    title: collection.title,
-    description: collection.description,
-    icon: collection.icon_url || "",
-    widgets: modules.map((m) => ({
-      id: m.widget_id || m.id,
+  const widgets = await Promise.all(modules.map(async (m) => {
+    // Resolve widget_id: read from JS file if missing in DB
+    let widgetId = m.widget_id;
+    if (!widgetId) {
+      try {
+        const storageKey = m.oss_key || m.filename;
+        const content = await store.read(m.collection_id, storageKey);
+        if (content) {
+          const meta = parseWidgetMetadata(content.toString("utf8"));
+          widgetId = meta?.id || null;
+        }
+      } catch { /* fallback to m.id below */ }
+    }
+
+    return {
+      id: widgetId || m.id,
       title: m.title || m.filename,
       description: m.description || "",
       requiredVersion: m.required_version || "0.0.1",
@@ -47,7 +53,14 @@ export async function GET(
         const base = store.getUrl?.(m.collection_id, storageKey) || `${siteUrl}/api/modules/${m.id}/raw`;
         return m.updated_at ? `${base}?v=${m.updated_at}` : base;
       })(),
-    })),
+    };
+  }));
+
+  const fwd = {
+    title: collection.title,
+    description: collection.description,
+    icon: collection.icon_url || "",
+    widgets,
   };
 
   return NextResponse.json(fwd, {
