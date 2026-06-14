@@ -12,11 +12,6 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ slug: string }> }
 ) {
-  const ua = request.headers.get("user-agent") || "";
-  if (!ua.includes("Forward")) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
-
   const { slug } = await params;
   const db = await getBackendDb();
   const collection = await db.prepare("SELECT * FROM collections WHERE slug = ?").get(slug) as Record<string, unknown> | undefined;
