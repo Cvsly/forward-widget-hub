@@ -7,11 +7,6 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const ua = request.headers.get("user-agent") || "";
-  if (!ua.includes("Forward")) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
-
   const { id } = await params;
   const db = await getBackendDb();
   const mod = await db.prepare("SELECT id, collection_id, filename, is_encrypted, oss_key FROM modules WHERE id = ?").get(id) as ModuleRow | undefined;
